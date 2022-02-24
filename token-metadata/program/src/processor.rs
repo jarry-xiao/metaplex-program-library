@@ -1,34 +1,34 @@
-use std::ops::Deref;
 use crate::{
     assertions::{
         collection::{
             assert_collection_update_is_valid, assert_collection_verify_is_valid,
             assert_has_collection_authority,
         },
-        uses::process_use_authority_validation,
+        uses::{
+            assert_use_authority_derivation, assert_valid_bump, process_use_authority_validation,
+        },
     },
     deprecated_processor::{
         process_deprecated_create_metadata_accounts, process_deprecated_update_metadata_accounts,
     },
     error::MetadataError,
     instruction::MetadataInstruction,
+    solana_program::program_memory::sol_memset,
     state::{
         Collection, CollectionAuthorityRecord, DataV2, Key, MasterEditionV1, MasterEditionV2,
         Metadata, TokenStandard, UseAuthorityRecord, UseMethod, Uses, BURN, COLLECTION_AUTHORITY,
-        COLLECTION_AUTHORITY_RECORD_SIZE, EDITION, MAX_MASTER_EDITION_LEN, PREFIX, USER,
-        USE_AUTHORITY_RECORD_SIZE, EDITION_MARKER_BIT_SIZE
-    },
-    solana_program::{
-        program_memory::{ sol_memset},
+        COLLECTION_AUTHORITY_RECORD_SIZE, EDITION, MAX_MASTER_EDITION_LEN,
+        MAX_METADATA_LEN, PREFIX, USER, USE_AUTHORITY_RECORD_SIZE,
     },
     utils::{
-        assert_currently_holding, assert_data_valid, assert_derivation, assert_initialized,
-        assert_mint_authority_matches_mint, assert_owned_by, assert_signer, assert_delegated_tokens,
-        assert_token_program_matches_package, assert_update_authority_is_correct, assert_freeze_authority_matches_mint,
+        assert_currently_holding, assert_data_valid, assert_delegated_tokens, assert_derivation,
+        assert_freeze_authority_matches_mint, assert_mint_authority_matches_mint, assert_owned_by,
+        assert_owned_by_same_program, assert_owned_by_token_program, assert_signer,
+        assert_token_program_matches_package, assert_update_authority_is_correct,
         create_or_allocate_account_raw, get_owner_from_token_account,
         process_create_metadata_accounts_logic,
         process_mint_new_edition_from_master_edition_via_token_logic, puff_out_data_fields,
-        spl_token_burn, transfer_mint_authority, CreateMetadataAccountsLogicArgs,
+        spl_token_burn, transfer_mint_authority, unpack, CreateMetadataAccountsLogicArgs,
         MintNewEditionFromMasterEditionViaTokenLogicArgs, TokenBurnParams,
     },
 };
@@ -43,12 +43,11 @@ use solana_program::{
     program_error::ProgramError,
     pubkey::Pubkey,
 };
-use spl_token::{
-    instruction::{approve, revoke, freeze_account, thaw_account},
+use spl_token_2022::{
+    instruction::{approve, freeze_account, revoke, thaw_account},
     state::{Account, Mint},
+    extension::StateWithExtensionsMut,
 };
-use spl_token::instruction::close_account;
-use crate::assertions::uses::{assert_use_authority_derivation, assert_valid_bump};
 
 pub fn process_instruction<'a>(
     program_id: &'a Pubkey,
@@ -207,6 +206,10 @@ pub fn process_instruction<'a>(
             msg!("Instruction: Thaw Delegated Account");
             process_thaw_delegated_account(program_id, accounts)
         }
+        MetadataInstruction::CloseMetadataAndMasterEdition => {
+            msg!("Instruction: Close Metadata and Master Edition");
+            process_close_metadata_and_master_edition(program_id, accounts)
+        }
     }
 }
 
@@ -317,11 +320,11 @@ pub fn process_update_primary_sale_happened_via_token(
     let owner_info = next_account_info(account_info_iter)?;
     let token_account_info = next_account_info(account_info_iter)?;
 
-    let token_account: Account = assert_initialized(token_account_info)?;
+    let token_account: Account = unpack::<spl_token_2022::state::Account>(token_account_info)?;
     let mut metadata = Metadata::from_account_info(metadata_account_info)?;
 
     assert_owned_by(metadata_account_info, program_id)?;
-    assert_owned_by(token_account_info, &spl_token::id())?;
+    assert_owned_by_token_program(token_account_info)?;
 
     if !owner_info.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -376,7 +379,10 @@ pub fn process_sign_metadata(program_id: &Pubkey, accounts: &[AccountInfo]) -> P
     Ok(())
 }
 
-pub fn process_remove_creator_verification(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+pub fn process_remove_creator_verification(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
 
     let metadata_info = next_account_info(account_info_iter)?;
@@ -426,7 +432,7 @@ pub fn process_create_master_edition(
     let rent_info = next_account_info(account_info_iter)?;
 
     let metadata = Metadata::from_account_info(metadata_account_info)?;
-    let mint: Mint = assert_initialized(mint_info)?;
+    let mint: Mint = unpack::<spl_token_2022::state::Mint>(mint_info)?;
 
     let bump_seed = assert_derivation(
         program_id,
@@ -442,7 +448,7 @@ pub fn process_create_master_edition(
     assert_token_program_matches_package(token_program_info)?;
     assert_mint_authority_matches_mint(&mint.mint_authority, mint_authority_info)?;
     assert_owned_by(metadata_account_info, program_id)?;
-    assert_owned_by(mint_info, &spl_token::id())?;
+    assert_owned_by_token_program(mint_info)?;
 
     if metadata.mint != *mint_info.key {
         return Err(MetadataError::MintMismatch.into());
@@ -557,11 +563,11 @@ pub fn process_convert_master_edition_v1_to_v2(
     let printing_mint_info = next_account_info(account_info_iter)?;
 
     assert_owned_by(master_edition_info, program_id)?;
-    assert_owned_by(one_time_printing_auth_mint_info, &spl_token::id())?;
-    assert_owned_by(printing_mint_info, &spl_token::id())?;
+    assert_owned_by_token_program(one_time_printing_auth_mint_info)?;
+    assert_owned_by_same_program(printing_mint_info, one_time_printing_auth_mint_info)?;
     let master_edition: MasterEditionV1 = MasterEditionV1::from_account_info(master_edition_info)?;
-    let printing_mint: Mint = assert_initialized(printing_mint_info)?;
-    let auth_mint: Mint = assert_initialized(one_time_printing_auth_mint_info)?;
+    let printing_mint: Mint = unpack::<spl_token_2022::state::Mint>(printing_mint_info)?;
+    let auth_mint: Mint = unpack::<spl_token_2022::state::Mint>(one_time_printing_auth_mint_info)?;
     if master_edition.one_time_printing_authorization_mint != *one_time_printing_auth_mint_info.key
     {
         return Err(MetadataError::OneTimePrintingAuthMintMismatch.into());
@@ -746,7 +752,7 @@ pub fn verify_collection(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progr
 
     assert_owned_by(metadata_info, program_id)?;
     assert_owned_by(collection_info, program_id)?;
-    assert_owned_by(collection_mint, &spl_token::id())?;
+    assert_owned_by_token_program(collection_mint)?;
     assert_owned_by(edition_account_info, program_id)?;
 
     let mut metadata = Metadata::from_account_info(metadata_info)?;
@@ -793,7 +799,7 @@ pub fn unverify_collection(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pro
     assert_signer(collection_authority_info)?;
     assert_owned_by(metadata_info, program_id)?;
     assert_owned_by(collection_info, program_id)?;
-    assert_owned_by(collection_mint, &spl_token::id())?;
+    assert_owned_by_token_program(collection_mint)?;
     assert_owned_by(edition_account_info, program_id)?;
 
     let mut metadata = Metadata::from_account_info(metadata_info)?;
@@ -848,7 +854,9 @@ pub fn process_approve_use_authority(
     if metadata.uses.is_none() {
         return Err(MetadataError::Unusable.into());
     }
-    if *token_program_account_info.key != spl_token::id() {
+    if *token_program_account_info.key != spl_token::id()
+        && *token_program_account_info.key != spl_token_2022::id()
+    {
         return Err(MetadataError::InvalidTokenProgram.into());
     }
     assert_signer(&owner_info)?;
@@ -876,10 +884,7 @@ pub fn process_approve_use_authority(
         &user_info.key.as_ref(),
         &[bump_seed],
     ];
-    process_use_authority_validation(
-        use_authority_record_info.data_len(),
-        true,
-    )?;
+    process_use_authority_validation(use_authority_record_info.data_len(), true)?;
     create_or_allocate_account_raw(
         *program_id,
         use_authority_record_info,
@@ -936,7 +941,9 @@ pub fn process_revoke_use_authority(
     if metadata.uses.is_none() {
         return Err(MetadataError::Unusable.into());
     }
-    if *token_program_account_info.key != spl_token::id() {
+    if *token_program_account_info.key != spl_token::id()
+        && *token_program_account_info.key != spl_token_2022::id()
+    {
         return Err(MetadataError::InvalidTokenProgram.into());
     }
     assert_signer(&owner_info)?;
@@ -949,10 +956,7 @@ pub fn process_revoke_use_authority(
         token_account_info,
     )?;
     let data = &mut use_authority_record_info.try_borrow_mut_data()?;
-    process_use_authority_validation(
-        data.len(),
-        false,
-    )?;
+    process_use_authority_validation(data.len(), false)?;
     assert_owned_by(use_authority_record_info, program_id)?;
     let canonical_bump = assert_use_authority_derivation(
         program_id,
@@ -964,10 +968,7 @@ pub fn process_revoke_use_authority(
     if record.bump_empty() {
         record.bump = canonical_bump;
     }
-    assert_valid_bump(
-        canonical_bump,
-        &record
-    )?;
+    assert_valid_bump(canonical_bump, &record)?;
     let metadata_uses = metadata.uses.unwrap();
     if metadata_uses.use_method == UseMethod::Burn {
         invoke(
@@ -1015,7 +1016,9 @@ pub fn process_utilize(
     if metadata.uses.is_none() {
         return Err(MetadataError::Unusable.into());
     }
-    if *token_program_account_info.key != spl_token::id() {
+    if *token_program_account_info.key != spl_token::id()
+        && *token_program_account_info.key != spl_token_2022::id()
+    {
         return Err(MetadataError::InvalidTokenProgram.into());
     }
     assert_signer(&user_info)?;
@@ -1045,12 +1048,9 @@ pub fn process_utilize(
     if approved_authority_is_using {
         let use_authority_record_info = next_account_info(account_info_iter)?;
         let data = &mut *use_authority_record_info.try_borrow_mut_data()?;
-        process_use_authority_validation(
-            data.len(),
-            false,
-        )?;
+        process_use_authority_validation(data.len(), false)?;
         assert_owned_by(use_authority_record_info, program_id)?;
-        let canonical_bump= assert_use_authority_derivation(
+        let canonical_bump = assert_use_authority_derivation(
             program_id,
             use_authority_record_info,
             user_info,
@@ -1061,10 +1061,7 @@ pub fn process_utilize(
         if record.bump_empty() {
             record.bump = canonical_bump;
         }
-        assert_valid_bump(
-            canonical_bump,
-            &record
-        )?;
+        assert_valid_bump(canonical_bump, &record)?;
         record.allowed_uses = record
             .allowed_uses
             .checked_sub(number_of_uses)
@@ -1124,7 +1121,7 @@ pub fn process_approve_collection_authority(
 
     let metadata = Metadata::from_account_info(metadata_info)?;
     assert_owned_by(metadata_info, program_id)?;
-    assert_owned_by(mint_info, &spl_token::id())?;
+    assert_owned_by_token_program(mint_info)?;
     assert_signer(&update_authority)?;
     assert_signer(&payer)?;
     if metadata.update_authority != *update_authority.key {
@@ -1180,7 +1177,7 @@ pub fn process_revoke_collection_authority(
     let mint_info = next_account_info(account_info_iter)?;
     let metadata = Metadata::from_account_info(metadata_info)?;
     assert_owned_by(metadata_info, program_id)?;
-    assert_owned_by(mint_info, &spl_token::id())?;
+    assert_owned_by_token_program(mint_info)?;
     assert_signer(&update_authority)?;
     if metadata.update_authority != *update_authority.key {
         return Err(MetadataError::UpdateAuthorityIncorrect.into());
@@ -1204,7 +1201,11 @@ pub fn process_revoke_collection_authority(
         .lamports()
         .checked_add(lamports)
         .ok_or(MetadataError::NumericalOverflowError)?;
-    sol_memset(*collection_authority_record.try_borrow_mut_data()?, 0, USE_AUTHORITY_RECORD_SIZE);
+    sol_memset(
+        *collection_authority_record.try_borrow_mut_data()?,
+        0,
+        USE_AUTHORITY_RECORD_SIZE,
+    );
 
     Ok(())
 }
@@ -1224,7 +1225,7 @@ pub fn set_and_verify_collection(program_id: &Pubkey, accounts: &[AccountInfo]) 
 
     assert_owned_by(metadata_info, program_id)?;
     assert_owned_by(collection_info, program_id)?;
-    assert_owned_by(collection_mint, &spl_token::id())?;
+    assert_owned_by_token_program(collection_mint)?;
     assert_owned_by(edition_account_info, program_id)?;
 
     let mut metadata = Metadata::from_account_info(metadata_info)?;
@@ -1276,23 +1277,20 @@ pub fn process_freeze_delegated_account(
     let mint_info = next_account_info(account_info_iter)?;
     let token_program_account_info = next_account_info(account_info_iter)?;
 
-    if *token_program_account_info.key != spl_token::id() {
+    if *token_program_account_info.key != spl_token::id()
+        && *token_program_account_info.key != spl_token_2022::id()
+    {
         return Err(MetadataError::InvalidTokenProgram.into());
     }
 
-    // assert that edition pda is the freeze authority of this mint 
-    let mint: Mint = assert_initialized(mint_info)?;
+    // assert that edition pda is the freeze authority of this mint
+    let mint: Mint = unpack::<spl_token_2022::state::Mint>(mint_info)?;
     assert_owned_by(edition_info, program_id)?;
     assert_freeze_authority_matches_mint(&mint.freeze_authority, edition_info)?;
 
     // assert delegate is signer and delegated tokens
     assert_signer(&delegate_info)?;
-    assert_delegated_tokens(
-        delegate_info,
-        mint_info,
-        token_account_info,
-    )?;
-
+    assert_delegated_tokens(delegate_info, mint_info, token_account_info)?;
 
     let edition_info_path = Vec::from([
         PREFIX.as_bytes(),
@@ -1336,23 +1334,19 @@ pub fn process_thaw_delegated_account(
     let edition_info = next_account_info(account_info_iter)?;
     let mint_info = next_account_info(account_info_iter)?;
     let token_program_account_info = next_account_info(account_info_iter)?;
-    if *token_program_account_info.key != spl_token::id() {
+    if *token_program_account_info.key != spl_token::id()
+        && *token_program_account_info.key != spl_token_2022::id()
+    {
         return Err(MetadataError::InvalidTokenProgram.into());
     }
 
-    // assert that edition pda is the freeze authority of this mint 
-    let mint: Mint = assert_initialized(mint_info)?;
+    // assert that edition pda is the freeze authority of this mint
+    let mint: Mint = unpack::<spl_token_2022::state::Mint>(mint_info)?;
     assert_owned_by(edition_info, program_id)?;
     assert_freeze_authority_matches_mint(&mint.freeze_authority, edition_info)?;
-   
     // assert delegate is signer and delegated tokens
     assert_signer(&delegate_info)?;
-    assert_delegated_tokens(
-        delegate_info,
-        mint_info,
-        token_account_info,
-    )?;
-    
+    assert_delegated_tokens(delegate_info, mint_info, token_account_info)?;
     let edition_info_path = Vec::from([
         PREFIX.as_bytes(),
         program_id.as_ref(),
@@ -1382,5 +1376,74 @@ pub fn process_thaw_delegated_account(
         ],
         &[&edition_info_seeds],
     )?;
+    Ok(())
+}
+
+pub fn process_close_metadata_and_master_edition(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let metadata_account_info = next_account_info(account_info_iter)?;
+    let master_edition_account_info = next_account_info(account_info_iter)?;
+    let mint_info = next_account_info(account_info_iter)?;
+    let _owner_info = next_account_info(account_info_iter)?;
+    let rent_collector_account_info = next_account_info(account_info_iter)?;
+    let token_program_info = next_account_info(account_info_iter)?;
+
+    if mint_info.data_len() > 0 {
+        let mut data = mint_info.try_borrow_mut_data()?;
+        let _mint = StateWithExtensionsMut::<Mint>::unpack_uninitialized(
+            &mut data,
+        )?;
+    }
+    msg!("Mint has been closed, attempting to remove Metadata and Master Edition");
+
+    // TODO add more checks
+    assert_derivation(
+        program_id,
+        metadata_account_info,
+        &[
+            PREFIX.as_bytes(),
+            program_id.as_ref(),
+            &mint_info.key.as_ref(),
+        ],
+    )?;
+    assert_derivation(
+        program_id,
+        master_edition_account_info,
+        &[
+            PREFIX.as_bytes(),
+            program_id.as_ref(),
+            &mint_info.key.as_ref(),
+            EDITION.as_bytes(),
+        ],
+    )?;
+
+    assert_token_program_matches_package(token_program_info)?;
+
+    let metadata_lamports = metadata_account_info.lamports();
+    let master_edition_lamports = master_edition_account_info.lamports();
+
+    let dest_starting_lamports = rent_collector_account_info.lamports();
+    **rent_collector_account_info.lamports.borrow_mut() = dest_starting_lamports
+        .checked_add(metadata_lamports)
+        .ok_or(MetadataError::NumericalOverflowError)?
+        .checked_add(master_edition_lamports)
+        .ok_or(MetadataError::NumericalOverflowError)?;
+
+    **metadata_account_info.lamports.borrow_mut() = 0;
+    **master_edition_account_info.lamports.borrow_mut() = 0;
+
+    sol_memset(
+        *metadata_account_info.data.borrow_mut(),
+        0,
+        MAX_METADATA_LEN,
+    );
+    sol_memset(
+        *master_edition_account_info.data.borrow_mut(),
+        0,
+        MAX_MASTER_EDITION_LEN,
+    );
     Ok(())
 }

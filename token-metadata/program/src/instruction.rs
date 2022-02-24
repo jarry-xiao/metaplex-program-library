@@ -322,7 +322,8 @@ pub enum MetadataInstruction {
     ///See [thaw_delegated_account] for Doc
     ThawDelegatedAccount,
     ///See [remove_creator_verification] for Doc
-    RemoveCreatorVerification
+    RemoveCreatorVerification,
+    CloseMetadataAndMasterEdition, 
 }
 
 /// Creates an CreateMetadataAccounts instruction
@@ -1156,6 +1157,42 @@ pub fn thaw_delegated_account(
             AccountMeta::new_readonly(spl_token::id(), false),
         ],
         data: MetadataInstruction::ThawDelegatedAccount
+            .try_to_vec()
+            .unwrap(),
+    }
+}
+
+//# Close Metadata and Master Edition 
+///
+/// ### Accounts:
+///
+///   0. `[writable]` Metadata account
+///   1. `[writable]` Master edition account 
+///   2. `[writable]` Mint account 
+///   3. `[signer]` Owner account
+///   4. `[writable]` Rent collector account 
+///   5. `[]` Token 2022 Program 
+#[allow(clippy::too_many_arguments)]
+pub fn close_metadata_and_master_edition(
+    program_id: Pubkey,
+    metadata: Pubkey,
+    master_edition: Pubkey,
+    mint: Pubkey,
+    owner: Pubkey,
+    rent_collector: Pubkey,
+) -> Instruction {
+    let accounts = vec![
+        AccountMeta::new(metadata, false),
+        AccountMeta::new(master_edition, false),
+        AccountMeta::new(mint, false),
+        AccountMeta::new_readonly(owner, true),
+        AccountMeta::new(rent_collector, false),
+        AccountMeta::new_readonly(spl_token_2022::id(), false),
+    ];
+    Instruction {
+        program_id,
+        accounts,
+        data: MetadataInstruction::CloseMetadataAndMasterEdition
             .try_to_vec()
             .unwrap(),
     }
