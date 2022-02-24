@@ -809,7 +809,7 @@ pub mod candy_machine {
         if ctx.remaining_accounts.len() > 0 {
             let seeds = [b"collection".as_ref(), pay.key.as_ref()];
             let pay = &ctx.remaining_accounts[0];
-            if pay.key != &Pubkey::find_program_address(&seeds, &nft_candy_machine_v2::id()).0 {
+            if pay.key != &Pubkey::find_program_address(&seeds, &candy_machine::id()).0 {
                 return Err(ErrorCode::MismatchedCollectionPDA.into());
             }
             let snapshot: u64 = pay.lamports();
